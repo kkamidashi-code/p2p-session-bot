@@ -1,20 +1,27 @@
 import asyncio
+import json
 import os
 import re
 import sqlite3
+import secrets
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
+BASE_URL = os.getenv('RENDER_EXTERNAL_URL', '').rstrip('/')
+PORT = int(os.getenv('PORT', '10000'))
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET') or secrets.token_urlsafe(32)
+WEBHOOK_PATH = f'/telegram/{WEBHOOK_SECRET}'
 DB = Path(__file__).with_name('p2p.sqlite3')
 D = lambda s: Decimal(str(s).replace(',', '.'))
 
@@ -156,7 +163,7 @@ async def new(m: Message, state: FSMContext):
             await m.answer('Спочатку заверши поточну сесію.')
             return
     await state.set_state(Flow.opening)
-    await m.answer('Введи початкові залишки: PLN USDT собівартість_1_USDT_у_PLN\nНаприклад: 351.9 0 3.91\nЯкщо USDT = 0, третє число може бути 0. /cancel — скасувати.')
+    await m.answer('Введи початкові залишки: PLN USDT собівартість_1_USDT_у_PLN\nНаприклад: 351.9 0 0\nЯкщо USDT = 0, третє число має бути 0. /cancel — скасувати.')
 
 @bot_dp.message(Flow.opening)
 async def opening(m: Message, state: FSMContext):
@@ -249,12 +256,49 @@ async def plain_text(m: Message):
     except (ValueError, InvalidOperation) as e:
         await m.answer(f'Помилка: {e}')
 
+async def health(request):
+    return web.json_response({'status': 'ok', 'service': 'p2p-session-bot'})
+
+async def telegram_webhook(request):
+    if request.match_info.get('secret') != WEBHOOK_SECRET:
+        raise web.HTTPForbidden(text='Forbidden')
+    try:
+        data = await request.json()
+        update = Update.model_validate(data, context={'bot': request.app['bot']})
+        await bot_dp.feed_update(request.app['bot'], update)
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(text='Invalid update')
+    return web.Response(text='OK')
+
+async def on_startup(app):
+    bot = app['bot']
+    await bot.set_webhook(f'{BASE_URL}{WEBHOOK_PATH}', secret_token=os.getenv('TELEGRAM_WEBHOOK_HEADER_SECRET', WEBHOOK_SECRET), drop_pending_updates=False)
+
+async def on_cleanup(app):
+    await app['bot'].delete_webhook(drop_pending_updates=False)
+    await app['bot'].session.close()
+
 async def main():
     if not TOKEN:
-        raise RuntimeError('Set BOT_TOKEN in .env')
+        raise RuntimeError('Set BOT_TOKEN in Render Environment Variables')
+    if not BASE_URL:
+        raise RuntimeError('RENDER_EXTERNAL_URL is missing. Deploy this app as a Render Web Service.')
     init_db()
     bot = Bot(TOKEN)
-    await bot_dp.start_polling(bot)
+    app = web.Application()
+    app['bot'] = bot
+    app.router.add_get('/', health)
+    app.router.add_post('/telegram/{secret}', telegram_webhook)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 if __name__ == '__main__':
     asyncio.run(main())
